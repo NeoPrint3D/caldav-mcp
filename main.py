@@ -26,45 +26,6 @@ mcp = FastMCP(
 )
 
 
-@mcp.resource("config://version")
-def get_version():
-    """
-    Returns the version of the CalDAV server.
-    """
-    return "CalDAV Server Version 1.0"
-
-
-@mcp.resource("config://connection")
-def get_connection_info():
-    """
-    Returns the CalDAV connection information (without sensitive data).
-    """
-    return {
-        "url": CALDAV_URL,
-        "username": CALDAV_USERNAME,
-        "status": "connected" if client else "disconnected",
-    }
-
-
-@mcp.resource("docs://item-types")
-def get_item_type_docs():
-    """
-    Documentation about calendar item types and their properties.
-    """
-    return {
-        "events": {
-            "description": "Time-based appointments and meetings",
-            "key_properties": ["start_time", "end_time", "location", "attendees"],
-            "states": ["confirmed", "tentative", "cancelled"],
-        },
-        "todos": {
-            "description": "Tasks and action items",
-            "key_properties": ["due_date", "priority", "completion_status"],
-            "states": ["NEEDS-ACTION", "IN-PROCESS", "COMPLETED", "CANCELLED"],
-        },
-    }
-
-
 @mcp.tool(
     name="get_calendar_info",
     description="Get detailed information about a specific calendar",
@@ -171,10 +132,18 @@ def get_calendar_capabilities(calendar_name: str):
         return f"Error checking capabilities: {str(e)}"
 
 
-@mcp.tool(name="get_calendar_events", description="Get events from a specific calendar")
+from typing import Optional
+from datetime import datetime
+
+
+@mcp.tool(
+    name="get_calendar_events",
+    description="Get events from specific or all calendars, annotating calendar names",
+)
 def get_calendar_events(
-    calendar_name: str = Field(
-        ..., description="Name of the calendar to get events from"
+    calendar_name: Optional[str] = Field(
+        None,
+        description="Name of the calendar to get events from (optional: gets from all if omitted)",
     ),
     start_date: Optional[str] = Field(
         None, description="Start date for events (YYYY-MM-DD format)"
@@ -185,15 +154,12 @@ def get_calendar_events(
     limit: Optional[int] = Field(10, description="Maximum number of events to return"),
 ):
     """
-    Tool to get events from a specific calendar with optional date filtering.
+    Tool to get events from a specific calendar or all calendars, with optional date filtering.
+    Each event is annotated with its calendar name.
     """
     try:
         principal = client.principal()
         calendars = principal.calendars()
-        calendar = next((cal for cal in calendars if cal.name == calendar_name), None)
-
-        if not calendar:
-            return f"Calendar '{calendar_name}' not found."
 
         # Set date range if provided
         start_dt = None
@@ -203,45 +169,70 @@ def get_calendar_events(
         if end_date:
             end_dt = datetime.strptime(end_date, "%Y-%m-%d")
 
-        # Get events with optional date filtering
-        if start_dt and end_dt:
-            events = calendar.date_search(start=start_dt, end=end_dt)
-        else:
-            events = calendar.events()
-
-        if not events:
-            return f"No events found in calendar '{calendar_name}'."
-
         event_list = []
-        for i, event in enumerate(events):
-            if limit and i >= limit:
-                break
+        total_events = 0
 
-            try:
-                vevent = event.vobject_instance.vevent  # type: ignore
-                summary = getattr(vevent, "summary", None)
-                dtstart = getattr(vevent, "dtstart", None)
-                dtend = getattr(vevent, "dtend", None)
-                description = getattr(vevent, "description", None)
+        # If calendar_name is provided, filter for that calendar only
+        if calendar_name:
+            calendar = next(
+                (cal for cal in calendars if cal.name == calendar_name), None
+            )
+            if not calendar:
+                return f"Calendar '{calendar_name}' not found."
+            calendars = [calendar]
 
-                event_info = {
-                    "summary": summary.value if summary else "No title",
-                    "start": str(dtstart.value) if dtstart else "No start time",
-                    "end": str(dtend.value) if dtend else "No end time",
-                    "description": (
-                        description.value if description else "No description"
-                    ),
-                }
+        for calendar in calendars:
+            cal_name = calendar.name
+            # Get events with optional date filtering
+            if start_dt and end_dt:
+                events = calendar.date_search(start=start_dt, end=end_dt)
+            else:
+                events = calendar.events()
 
-                event_list.append(
-                    f"{event_info['summary']} ({event_info['start']} - {event_info['end']})"
-                )
-            except Exception as e:
-                event_list.append(f"Error parsing event: {str(e)}")
+            for i, event in enumerate(events):
+                if limit and total_events >= limit:
+                    break
 
-        return f"Events in '{calendar_name}' ({len(event_list)} found): " + "; ".join(
-            event_list
-        )
+                try:
+                    vevent = event.vobject_instance.vevent  # type: ignore
+                    summary = getattr(vevent, "summary", None)
+                    dtstart = getattr(vevent, "dtstart", None)
+                    dtend = getattr(vevent, "dtend", None)
+                    description = getattr(vevent, "description", None)
+
+                    event_info = {
+                        "summary": summary.value if summary else "No title",
+                        "start": str(dtstart.value) if dtstart else "No start time",
+                        "end": str(dtend.value) if dtend else "No end time",
+                        "description": (
+                            description.value if description else "No description"
+                        ),
+                        "calendar": cal_name,
+                    }
+
+                    event_list.append(
+                        f"{event_info['summary']} (from: {event_info['calendar']}, {event_info['start']} - {event_info['end']})"
+                    )
+                    total_events += 1
+                except Exception as e:
+                    event_list.append(f"Error parsing event from {cal_name}: {str(e)}")
+                    total_events += 1
+
+        if not event_list:
+            if calendar_name:
+                return f"No events found in calendar '{calendar_name}'."
+            else:
+                return "No events found in any calendar."
+
+        if calendar_name:
+            return (
+                f"Events in '{calendar_name}' ({len(event_list)} found): "
+                + "; ".join(event_list)
+            )
+        else:
+            return f"Events from all calendars ({total_events} found): " + "; ".join(
+                event_list
+            )
     except Exception as e:
         return f"Error retrieving events: {str(e)}"
 
@@ -542,10 +533,18 @@ def create_calendar(
         return f"Error creating calendar: {str(e)}"
 
 
-@mcp.tool(name="get_todos", description="Get todos from a specific calendar")
+from typing import Optional
+from datetime import datetime
+
+
+@mcp.tool(
+    name="get_todos",
+    description="Get todos from a specific or all calendars, annotating calendar names",
+)
 def get_todos(
-    calendar_name: str = Field(
-        ..., description="Name of the calendar to get todos from"
+    calendar_name: Optional[str] = Field(
+        None,
+        description="Name of the calendar to get todos from (optional: gets from all if omitted)",
     ),
     status: Optional[str] = Field(
         None,
@@ -554,65 +553,89 @@ def get_todos(
     limit: Optional[int] = Field(10, description="Maximum number of todos to return"),
 ):
     """
-    Tool to get todos from a specific calendar with optional status filtering.
+    Tool to get todos from a specific or all calendars, with optional status filtering.
+    Each todo is annotated with its calendar name.
     """
     try:
         principal = client.principal()
         calendars = principal.calendars()
-        calendar = next((cal for cal in calendars if cal.name == calendar_name), None)
 
-        if not calendar:
-            return f"Calendar '{calendar_name}' not found."
-
-        # Get todos
-        todos = calendar.todos()
-
-        if not todos:
-            return f"No todos found in calendar '{calendar_name}'."
+        # If calendar_name is provided, filter for that calendar only
+        if calendar_name:
+            calendar = next(
+                (cal for cal in calendars if cal.name == calendar_name), None
+            )
+            if not calendar:
+                return f"Calendar '{calendar_name}' not found."
+            calendars = [calendar]
 
         todo_list = []
-        for i, todo in enumerate(todos):
-            if limit and i >= limit:
-                break
+        total_todos = 0
 
-            try:
-                vtodo = todo.vobject_instance.vtodo  # type: ignore
-                summary = getattr(vtodo, "summary", None)
-                todo_status = getattr(vtodo, "status", None)
-                due = getattr(vtodo, "due", None)
-                priority = getattr(vtodo, "priority", None)
-                description = getattr(vtodo, "description", None)
-                completed = getattr(vtodo, "completed", None)
+        for calendar in calendars:
+            cal_name = calendar.name
+            todos = calendar.todos()
 
-                # Filter by status if specified
-                if (
-                    status
-                    and todo_status
-                    and todo_status.value.upper() != status.upper()
-                ):
-                    continue
+            for i, todo in enumerate(todos):
+                if limit and total_todos >= limit:
+                    break
 
-                todo_info = {
-                    "summary": summary.value if summary else "No title",
-                    "status": todo_status.value if todo_status else "NEEDS-ACTION",
-                    "due": str(due.value) if due else "No due date",
-                    "priority": priority.value if priority else "No priority",
-                    "description": (
-                        description.value if description else "No description"
-                    ),
-                    "completed": str(completed.value) if completed else "Not completed",
-                }
+                try:
+                    vtodo = todo.vobject_instance.vtodo  # type: ignore
+                    summary = getattr(vtodo, "summary", None)
+                    todo_status = getattr(vtodo, "status", None)
+                    due = getattr(vtodo, "due", None)
+                    priority = getattr(vtodo, "priority", None)
+                    description = getattr(vtodo, "description", None)
+                    completed = getattr(vtodo, "completed", None)
 
-                status_indicator = "✓" if todo_info["status"] == "COMPLETED" else "○"
-                todo_list.append(
-                    f"{status_indicator} {todo_info['summary']} (Due: {todo_info['due']}, Status: {todo_info['status']})"
-                )
-            except Exception as e:
-                todo_list.append(f"Error parsing todo: {str(e)}")
+                    # Filter by status if specified
+                    if (
+                        status
+                        and todo_status
+                        and todo_status.value.upper() != status.upper()
+                    ):
+                        continue
 
-        return f"Todos in '{calendar_name}' ({len(todo_list)} found): " + "; ".join(
-            todo_list
-        )
+                    todo_info = {
+                        "summary": summary.value if summary else "No title",
+                        "status": todo_status.value if todo_status else "NEEDS-ACTION",
+                        "due": str(due.value) if due else "No due date",
+                        "priority": priority.value if priority else "No priority",
+                        "description": (
+                            description.value if description else "No description"
+                        ),
+                        "completed": (
+                            str(completed.value) if completed else "Not completed"
+                        ),
+                        "calendar": cal_name,
+                    }
+
+                    status_indicator = (
+                        "✓" if todo_info["status"] == "COMPLETED" else "○"
+                    )
+                    todo_list.append(
+                        f"{status_indicator} {todo_info['summary']} (from: {todo_info['calendar']}, Due: {todo_info['due']}, Status: {todo_info['status']})"
+                    )
+                    total_todos += 1
+                except Exception as e:
+                    todo_list.append(f"Error parsing todo from {cal_name}: {str(e)}")
+                    total_todos += 1
+
+        if not todo_list:
+            if calendar_name:
+                return f"No todos found in calendar '{calendar_name}'."
+            else:
+                return "No todos found in any calendar."
+
+        if calendar_name:
+            return f"Todos in '{calendar_name}' ({len(todo_list)} found): " + "; ".join(
+                todo_list
+            )
+        else:
+            return f"Todos from all calendars ({total_todos} found): " + "; ".join(
+                todo_list
+            )
     except Exception as e:
         return f"Error retrieving todos: {str(e)}"
 
@@ -949,39 +972,6 @@ def search_todos(
         return result
     except Exception as e:
         return f"Error searching todos: {str(e)}"
-
-
-@mcp.tool(name="get_calendar_dashboard")
-def get_calendar_dashboard(calendar_name: str):
-    """
-    Get a summary dashboard showing both events and todos for a calendar.
-    """
-    try:
-        # Get recent events
-        recent_events = get_calendar_events(calendar_name, limit=5)
-
-        # Get pending todos
-        pending_todos = get_todos(calendar_name, status="NEEDS-ACTION", limit=5)
-
-        # Get completed todos
-        completed_todos = get_todos(calendar_name, status="COMPLETED", limit=3)
-
-        dashboard = f"""
-CALENDAR DASHBOARD: {calendar_name}
-=====================================
-
-UPCOMING EVENTS (5 most recent):
-{recent_events}
-
-PENDING TODOS:
-{pending_todos}
-
-RECENTLY COMPLETED TODOS:
-{completed_todos}
-"""
-        return dashboard
-    except Exception as e:
-        return f"Error creating dashboard: {str(e)}"
 
 
 if __name__ == "__main__":
