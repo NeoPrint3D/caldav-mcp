@@ -1,5 +1,5 @@
 [project]
-name = "caldav-mcp-server"
+name = "caldav-mcp"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
