@@ -3,7 +3,7 @@ from datetime import datetime
 from dotenv import load_dotenv
 import os
 import uuid
-from typing import Optional
+from typing import Optional, Dict, Any, List
 import vobject
 
 from mcp.server.fastmcp import FastMCP
@@ -25,6 +25,46 @@ mcp = FastMCP(
     instructions="This is a CalDAV server. Use the tools provided to interact with your calendars and todos",
 )
 
+@mcp.resource("config://instructions")
+def caldav_instructions() -> str:
+    return """# CalDAV MCP Time Handling Instructions
+
+## CRITICAL TIME CONVERSION RULES
+
+### 1. MILITARY TIME TO 24-HOUR FORMAT
+- Convert military time: `0645` → `06:45`, `1545` → `15:45`, `2359` → `23:59`
+- Use format: `YYYY-MM-DD HH:MM` for all datetime parameters
+
+### 2. TIMEZONE CONVERSION (MOUNTAIN TIME TO UTC)
+- **Mountain Daylight Time (March-November)**: ADD 6 hours
+- **Mountain Standard Time (November-March)**: ADD 7 hours
+- Example: `0645 MT` on Aug 11 → `2025-08-11 12:45` (UTC)
+- Example: `1545 MT` on Aug 11 → `2025-08-11 21:45` (UTC)
+
+### 3. EVENT PARAMETERS
+```
+start_datetime: "YYYY-MM-DD HH:MM" (UTC)
+end_datetime: "YYYY-MM-DD HH:MM" (UTC)
+summary: "Event Title"
+description: "Day - Designation - Uniform" (optional)
+location: "Location Name" (if specified)
+```
+
+### 4. COMMON CONVERSIONS (MT → UTC in August)
+```
+0645 MT → 12:45 UTC    0700 MT → 13:00 UTC
+0705 MT → 13:05 UTC    0715 MT → 13:15 UTC
+0723 MT → 13:23 UTC    1130 MT → 17:30 UTC
+1150 MT → 17:50 UTC    1230 MT → 18:30 UTC
+1323 MT → 19:23 UTC    1545 MT → 21:45 UTC
+```
+
+### 5. TODOS
+- Use same timezone conversion rules
+- For all day events the format should be "YYYY-MM-DD" (UTC)
+- For timed events the format should be "YYYY-MM-DD HH:MM" (UTC)
+
+**REMEMBER**: Input documents show local Mountain Time - always convert to UTC by adding 6 hours (MDT) or 7 hours (MST)."""
 
 @mcp.tool(
     name="get_calendar_info",
@@ -282,6 +322,91 @@ def create_calendar_event(
     except Exception as e:
         return f"Error creating event: {str(e)}"
 
+
+
+@mcp.tool(
+    name="create_calendar_events",
+    description="Create multiple events in a specific calendar in batch."
+)
+def create_calendar_events(
+    calendar_name: str = Field(..., description="Name of the target calendar"),
+    events: List[Dict[str, Any]] = Field(
+        ..., description=(
+            "List of events. Each item must include: "
+            "summary, start_datetime (YYYY-MM-DD HH:MM), end_datetime (YYYY-MM-DD HH:MM). "
+            "Optional: description, location."
+        )
+    )
+) -> Dict[str, List[str]]:
+    """
+    Creates multiple events in a given calendar.
+    Returns a dict with 'success' and 'errors' lists.
+    """
+    results = {"success": [], "errors": []}
+
+    try:
+        # Locate target calendar once, not per event
+        principal = client.principal()
+        calendars = principal.calendars()
+        calendar = next((cal for cal in calendars if cal.name == calendar_name), None)
+
+        if not calendar:
+            return {"success": [], "errors": [f"Calendar '{calendar_name}' not found."]}
+
+        # Process each event in the batch
+        for idx, evt in enumerate(events, start=1):
+            try:
+                summary = evt.get("summary")
+                start_str = evt.get("start_datetime")
+                end_str = evt.get("end_datetime")
+                description = evt.get("description")
+                location = evt.get("location")
+
+                # Required field checks
+                if not summary or not start_str or not end_str:
+                    raise ValueError("Missing one of: summary, start_datetime, end_datetime")
+
+                # Parse and validate datetimes
+                try:
+                    start_dt = datetime.strptime(start_str, "%Y-%m-%d %H:%M")
+                    end_dt = datetime.strptime(end_str, "%Y-%m-%d %H:%M")
+                except ValueError:
+                    raise ValueError("Invalid datetime format. Use 'YYYY-MM-DD HH:MM'.")
+
+                if end_dt <= start_dt:
+                    raise ValueError("end_datetime must be after start_datetime")
+
+                # Build vEvent
+                event_obj = vobject.iCalendar()
+                vevent = event_obj.add("vevent")
+                vevent.add("uid").value = f"{datetime.now().timestamp()}-{summary}"
+                vevent.add("summary").value = summary
+                vevent.add("dtstart").value = start_dt.strftime("%Y%m%dT%H%M%S")
+                vevent.add("dtend").value = end_dt.strftime("%Y%m%dT%H%M%S")
+                vevent.add("dtstamp").value = datetime.now()
+
+                if description:
+                    vevent.add("description").value = description
+                if location:
+                    vevent.add("location").value = location
+
+                # Save to the calendar
+                calendar.save_event(event_obj.serialize())
+                results["success"].append(
+                    f"[Event #{idx}] '{summary}' created successfully."
+                )
+
+            except Exception as e:
+                # Don't stop entire batch — log per event failure
+                results["errors"].append(
+                    f"[Event #{idx}] {evt.get('summary', '<no summary>')}: {str(e)}"
+                )
+
+        return results
+
+    except Exception as e:
+        # Calendar lookup or catastrophic failure
+        return {"success": [], "errors": [f"Batch creation failed: {str(e)}"]}
 
 @mcp.tool(name="delete_calendar_event", description="Delete an event from a calendar")
 def delete_calendar_event(
@@ -585,7 +710,6 @@ def get_todos(
                     summary = getattr(vtodo, "summary", None)
                     todo_status = getattr(vtodo, "status", None)
                     due = getattr(vtodo, "due", None)
-                    priority = getattr(vtodo, "priority", None)
                     description = getattr(vtodo, "description", None)
                     completed = getattr(vtodo, "completed", None)
 
@@ -601,7 +725,6 @@ def get_todos(
                         "summary": summary.value if summary else "No title",
                         "status": todo_status.value if todo_status else "NEEDS-ACTION",
                         "due": str(due.value) if due else "No due date",
-                        "priority": priority.value if priority else "No priority",
                         "description": (
                             description.value if description else "No description"
                         ),
@@ -647,8 +770,8 @@ def create_todo(
     ),
     summary: str = Field(..., description="Title/summary of the todo"),
     description: Optional[str] = Field(None, description="Description of the todo"),
-    due_date: Optional[str] = Field(None, description="Due date (YYYY-MM-DD format)"),
-    priority: Optional[int] = Field(None, description="Priority (1=highest, 9=lowest)"),
+    due_date: Optional[str] = Field(None, description="Due date (YYYY-MM-DD format for all-day, YYYY-MM-DD HH:MM for specific time)"),
+    all_day: Optional[bool] = Field(True, description="Whether the todo is all-day (default: True)"),
     status: Optional[str] = Field(
         "NEEDS-ACTION",
         description="Status: NEEDS-ACTION, IN-PROCESS, COMPLETED, CANCELLED",
@@ -656,6 +779,7 @@ def create_todo(
 ):
     """
     Tool to create a new todo in a specific calendar.
+    Supports both all-day todos (default) and timed todos.
     """
     try:
         principal = client.principal()
@@ -678,21 +802,125 @@ def create_todo(
 
         if description:
             vtodo.add("description").value = description
+            
         if due_date:
-            due_dt = datetime.strptime(due_date, "%Y-%m-%d")
-            vtodo.add("due").value = due_dt
-        if priority:
-            vtodo.add("priority").value = priority
-
+            try:
+                # Check if time is included in the date string
+                has_time = len(due_date.split()) > 1 or ":" in due_date
+                
+                if has_time and not all_day:
+                    # Parse as datetime (YYYY-MM-DD HH:MM)
+                    due_dt = datetime.strptime(due_date, "%Y-%m-%d %H:%M")
+                    vtodo.add("due").value = due_dt
+                else:
+                    # Parse as date only (YYYY-MM-DD) - creates all-day todo
+                    # Extract just the date part if time was provided but all_day=True
+                    date_part = due_date.split()[0] if " " in due_date else due_date
+                    due_dt = datetime.strptime(date_part, "%Y-%m-%d").date()
+                    vtodo.add("due").value = due_dt
+                    
+            except ValueError as e:
+                return f"Error parsing date format: {due_date}. Please use YYYY-MM-DD for all-day or YYYY-MM-DD HH:MM for timed todos. Error: {str(e)}"
+                    
+      
         # Save the todo
         calendar.save_event(todo.serialize())
 
-        return f"Todo '{summary}' created successfully in calendar '{calendar_name}'"
-    except ValueError as e:
-        return f"Error parsing date format: {str(e)}. Please use YYYY-MM-DD format."
+        todo_type = "all-day" if all_day else "timed"
+        return f"Todo '{summary}' created successfully as {todo_type} in calendar '{calendar_name}'"
+        
     except Exception as e:
         return f"Error creating todo: {str(e)}"
 
+@mcp.tool(
+    name="create_todos",
+    description="Create multiple todos in a specific calendar in batch."
+)
+def create_todos(
+    calendar_name: str = Field(..., description="The name of the target calendar"),
+    todos: List[Dict[str, Any]] = Field(
+        ..., description="A list of todos, each with summary, optional description, due_date, etc."
+    )
+) -> Dict[str, Any]:
+    """
+    Creates multiple todos in a given calendar.
+
+    Returns:
+        dict with 'success' list and 'errors' list for transparency.
+    """
+    results = {
+        "success": [],
+        "errors": []
+    }
+
+    try:
+        principal = client.principal()
+        calendars = principal.calendars()
+        calendar = next((cal for cal in calendars if cal.name == calendar_name), None)
+
+        if not calendar:
+            return {"success": [], "errors": [f"Calendar '{calendar_name}' not found."]}
+
+        for idx, todo_data in enumerate(todos, start=1):
+            try:
+                # Validate required fields
+                summary = todo_data.get("summary")
+                if not summary:
+                    raise ValueError("Missing required field: summary")
+
+                description = todo_data.get("description")
+                due_date = todo_data.get("due_date")
+                all_day: bool = todo_data.get("all_day", True)
+                status = todo_data.get("status", "NEEDS-ACTION")
+
+                # Build vTODO object
+                todo = vobject.iCalendar()
+                todo.add("vtodo")
+
+                vtodo = todo.vtodo
+                vtodo.add("uid").value = str(uuid.uuid4())
+                vtodo.add("summary").value = summary
+                vtodo.add("status").value = status.upper()
+                now = datetime.now()
+                vtodo.add("dtstamp").value = now
+                vtodo.add("created").value = now
+
+                if description:
+                    vtodo.add("description").value = description
+
+                if due_date:
+                    try:
+                        has_time = len(due_date.split()) > 1 or ":" in due_date
+                        if has_time and not all_day:
+                            due_dt = datetime.strptime(due_date, "%Y-%m-%d %H:%M")
+                            vtodo.add("due").value = due_dt
+                        else:
+                            date_part = due_date.split()[0]
+                            due_dt = datetime.strptime(date_part, "%Y-%m-%d").date()
+                            vtodo.add("due").value = due_dt
+                    except ValueError as e:
+                        raise ValueError(
+                            f"Invalid date format for due_date '{due_date}': {str(e)}"
+                        )
+
+                # Save event
+                calendar.save_event(todo.serialize())
+                todo_type = "all-day" if all_day else "timed"
+                results["success"].append(
+                    f"Todo '{summary}' created successfully as {todo_type}."
+                )
+
+            except Exception as e:
+                # Capture any error for this item without stopping the batch
+                results["errors"].append(
+                    f"[Todo #{idx}] {todo_data.get('summary', '<no summary>')}: {str(e)}"
+                )
+
+        return results
+
+    except Exception as e:
+        # Catastrophic failure (e.g., principal retrieval, calendar access)
+        return {"success": [], "errors": [f"Batch creation failed: {str(e)}"]}
 
 @mcp.tool(name="update_todo", description="Update an existing todo in a calendar")
 def update_todo(
@@ -710,9 +938,6 @@ def update_todo(
     ),
     new_due_date: Optional[str] = Field(
         None, description="New due date (YYYY-MM-DD format)"
-    ),
-    new_priority: Optional[int] = Field(
-        None, description="New priority (1=highest, 9=lowest)"
     ),
     new_status: Optional[str] = Field(
         None, description="New status: NEEDS-ACTION, IN-PROCESS, COMPLETED, CANCELLED"
@@ -764,11 +989,7 @@ def update_todo(
                 vtodo.due.value = due_dt
             else:
                 vtodo.add("due").value = due_dt
-        if new_priority:
-            if hasattr(vtodo, "priority"):
-                vtodo.priority.value = new_priority
-            else:
-                vtodo.add("priority").value = new_priority
+    
         if new_status:
             vtodo.status.value = new_status.upper()
             if new_status.upper() == "COMPLETED":
