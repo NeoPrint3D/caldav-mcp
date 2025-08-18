@@ -27,6 +27,7 @@ mcp = FastMCP(
 
 @mcp.resource("config://instructions")
 def caldav_instructions() -> str:
+    # Add your custom instructions for claude on how to deal with timezones or if you are using different time formats
     return """# CalDAV MCP Time Handling Instructions
 
 ## CRITICAL TIME CONVERSION RULES
