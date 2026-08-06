@@ -1,10 +1,13 @@
 import caldav
-from datetime import datetime
+from datetime import date, datetime, timedelta, timezone
 from dotenv import load_dotenv
 import os
 import uuid
 from typing import Optional, Dict, Any, List
-import vobject
+import zoneinfo
+
+import icalendar
+from icalendar import Calendar, Event, Todo
 
 from mcp.server.fastmcp import FastMCP
 from pydantic import Field
@@ -20,52 +23,267 @@ client = caldav.DAVClient(
     url=CALDAV_URL, username=CALDAV_USERNAME, password=CALDAV_PASSWORD
 )
 
+UTC = timezone.utc
+
+# The server runs wherever it runs (often remote). The timezone must come from
+# the client, so every datetime tool accepts a `timezone` parameter (IANA name,
+# e.g. "America/Denver"). If omitted, the CALDAV_TIMEZONE env var is used;
+# otherwise UTC is assumed.
+try:
+    DEFAULT_TZ = zoneinfo.ZoneInfo(os.getenv("CALDAV_TIMEZONE", "UTC"))
+except Exception:
+    DEFAULT_TZ = UTC
+
+
+def resolve_tz(name: Optional[str]):
+    """Resolve a client-supplied IANA timezone name, falling back to the default."""
+    if name:
+        try:
+            return zoneinfo.ZoneInfo(name)
+        except Exception:
+            pass
+    return DEFAULT_TZ
+
+
 mcp = FastMCP(
     "CalDAV Server",
-    instructions="This is a CalDAV server. Use the tools provided to interact with your calendars and todos",
+    instructions=(
+        "This is a CalDAV server. Use the tools provided to interact with your "
+        "calendars and todos. Datetime tools accept a `timezone` parameter so times "
+        "are interpreted and returned in the user's local timezone (converted to/from "
+        "UTC for storage)."
+    ),
 )
+
+
+# ---------------------------------------------------------------------------
+# Datetime helpers
+# ---------------------------------------------------------------------------
+
+def parse_dt_local(value: str, tz) -> datetime:
+    """Parse 'YYYY-MM-DD HH:MM' as wall-clock time in `tz` and return it as UTC."""
+    naive = datetime.strptime(value, "%Y-%m-%d %H:%M")
+    return naive.replace(tzinfo=tz).astimezone(UTC)
+
+
+def parse_date(value: str) -> date:
+    """Parse 'YYYY-MM-DD' as a plain date."""
+    return datetime.strptime(value, "%Y-%m-%d").date()
+
+
+def to_utc(dt, tz) -> Optional[datetime]:
+    """Normalize a date/datetime to a UTC-aware datetime. Naive values are assumed to be in `tz`."""
+    if dt is None:
+        return None
+    if isinstance(dt, date) and not isinstance(dt, datetime):
+        dt = datetime(dt.year, dt.month, dt.day)
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=tz).astimezone(UTC)
+    return dt.astimezone(UTC)
+
+
+def to_local(dt, tz) -> Optional[datetime]:
+    """Convert a date/datetime to `tz` for display. Naive = wall clock in `tz`."""
+    if dt is None:
+        return None
+    if isinstance(dt, date) and not isinstance(dt, datetime):
+        return dt
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=tz)
+    return dt.astimezone(tz)
+
+
+def format_dt(dt, tz) -> str:
+    """Format a date/datetime for display. Timed values are shown in `tz`."""
+    if dt is None:
+        return "No time"
+    if isinstance(dt, date) and not isinstance(dt, datetime):
+        return dt.isoformat()
+    return to_local(dt, tz).strftime("%Y-%m-%d %H:%M %Z")
+
+
+def day_start(d: date, tz) -> datetime:
+    """Start of the day in `tz` as a UTC-aware datetime (for filtering stored UTC times)."""
+    return datetime(d.year, d.month, d.day, tzinfo=tz).astimezone(UTC)
+
+
+def day_after(d: date, tz) -> datetime:
+    """The day after `d` at 00:00 in `tz` (exclusive upper bound for date filters)."""
+    return day_start(d, tz) + timedelta(days=1)
+
+
+def parse_due(value: str, tz):
+    """Parse a due value: 'YYYY-MM-DD' -> date, 'YYYY-MM-DD HH:MM' -> UTC datetime."""
+    if ":" in value or len(value.split()) > 1:
+        return parse_dt_local(value, tz)
+    return parse_date(value)
+
+
+# ---------------------------------------------------------------------------
+# Calendar helpers
+# ---------------------------------------------------------------------------
+
+def _find_calendar(name: str):
+    principal = client.principal()
+    calendars = principal.calendars()
+    calendar = next((cal for cal in calendars if cal.name == name), None)
+    if not calendar:
+        raise LookupError(f"Calendar '{name}' not found.")
+    return calendar
+
+
+def _new_calendar() -> Calendar:
+    cal = icalendar.Calendar()
+    cal.add("prodid", "-//caldav-mcp//caldav//EN")
+    cal.add("version", "2.0")
+    return cal
+
+
+def _build_event_ical(
+    summary: str,
+    start_dt: datetime,
+    end_dt: datetime,
+    description: Optional[str] = None,
+    location: Optional[str] = None,
+) -> str:
+    cal = _new_calendar()
+    event = Event()
+    event.add("uid", str(uuid.uuid4()))
+    event.add("summary", summary)
+    event.add("dtstart", start_dt)
+    event.add("dtend", end_dt)
+    event.add("dtstamp", datetime.now(UTC))
+    if description:
+        event.add("description", description)
+    if location:
+        event.add("location", location)
+    cal.add_component(event)
+    return cal.to_ical().decode("utf-8")
+
+
+def _build_todo_ical(
+    summary: str,
+    description: Optional[str] = None,
+    due: Any = None,
+    status: str = "NEEDS-ACTION",
+) -> str:
+    cal = _new_calendar()
+    todo = Todo()
+    todo.add("uid", str(uuid.uuid4()))
+    todo.add("summary", summary)
+    todo.add("status", status.upper() if isinstance(status, str) else "NEEDS-ACTION")
+    now = datetime.now(UTC)
+    todo.add("dtstamp", now)
+    todo.add("created", now)
+    if description:
+        todo.add("description", description)
+    if due is not None:
+        todo.add("due", due)
+    cal.add_component(todo)
+    return cal.to_ical().decode("utf-8")
+
 
 @mcp.resource("config://instructions")
 def caldav_instructions() -> str:
-    # Add your custom instructions for claude on how to deal with timezones or if you are using different time formats
-    return """# CalDAV MCP Time Handling Instructions
+    # Custom instructions for claude on how to deal with timezones and date formats
+    return f"""# CalDAV MCP Time Handling Instructions
 
-## CRITICAL TIME CONVERSION RULES
+## TIMEZONE POLICY (CLIENT-SUPPLIED)
+- This server runs remotely and does NOT know your timezone automatically. YOU must supply it.
+- **Pass your timezone to every datetime tool** via the `timezone` parameter (IANA name, e.g. `"America/Denver"`, `"UTC"`, `"Europe/Berlin"`).
+- Datetime inputs are interpreted as **the user's local wall-clock time** in that timezone: "YYYY-MM-DD HH:MM"
+- All-day events/todos use format: "YYYY-MM-DD"
+- The server stores everything in UTC internally and returns times back to you in the timezone you supplied.
+- If `timezone` is omitted, the server falls back to the `CALDAV_TIMEZONE` env var, else UTC.
 
-### 1. MILITARY TIME TO 24-HOUR FORMAT
-- Convert military time: `0645` → `06:45`, `1545` → `15:45`, `2359` → `23:59`
-- Use format: `YYYY-MM-DD HH:MM` for all datetime parameters
-
-### 2. TIMEZONE CONVERSION (MOUNTAIN TIME TO UTC)
-- **Mountain Daylight Time (March-November)**: ADD 6 hours
-- **Mountain Standard Time (November-March)**: ADD 7 hours
-- Example: `0645 MT` on Aug 11 → `2025-08-11 12:45` (UTC)
-- Example: `1545 MT` on Aug 11 → `2025-08-11 21:45` (UTC)
-
-### 3. EVENT PARAMETERS
+## EVENT PARAMETERS
 ```
-start_datetime: "YYYY-MM-DD HH:MM" (UTC)
-end_datetime: "YYYY-MM-DD HH:MM" (UTC)
+timezone: "America/Denver" (required - user's IANA timezone)
+start_datetime: "YYYY-MM-DD HH:MM" (user's local time)
+end_datetime: "YYYY-MM-DD HH:MM" (user's local time)
 summary: "Event Title"
 description: "Day - Designation - Uniform" (optional)
-location: "Location Name" (if specified)
+location: "Location Name" (optional)
 ```
 
-### 4. COMMON CONVERSIONS (MT → UTC in August)
+## TODO PARAMETERS
 ```
-0645 MT → 12:45 UTC    0700 MT → 13:00 UTC
-0705 MT → 13:05 UTC    0715 MT → 13:15 UTC
-0723 MT → 13:23 UTC    1130 MT → 17:30 UTC
-1150 MT → 17:50 UTC    1230 MT → 18:30 UTC
-1323 MT → 19:23 UTC    1545 MT → 21:45 UTC
+timezone: "America/Denver" (required - user's IANA timezone)
+due_date: "YYYY-MM-DD" (all-day) or "YYYY-MM-DD HH:MM" (timed, user's local time)
+all_day: true/false (default true)
 ```
 
-### 5. TODOS
-- Use same timezone conversion rules
-- For all day events the format should be "YYYY-MM-DD" (UTC)
-- For timed events the format should be "YYYY-MM-DD HH:MM" (UTC)
+## OUTPUT
+- All times returned by the server are shown in the timezone you supplied and labelled with the zone (e.g. `2026-08-11 06:45 MDT`).
+- Events are sorted chronologically. Date filters are applied and respected.
 
-**REMEMBER**: Input documents show local Mountain Time - always convert to UTC by adding 6 hours (MDT) or 7 hours (MST)."""
+**REMEMBER**: For every calendar/todo tool call, include the `timezone` parameter matching the user's location. Just pass times as they appear in source documents (e.g. `06:45` Mountain Time on Aug 11 -> `2026-08-11 06:45` with `timezone: "America/Denver"`). The server handles the timezone conversion automatically."""
+
+
+@mcp.prompt(
+    name="calendar_workflow",
+    description=(
+        "Comprehensive guidance for managing this user's course calendars: "
+        "Mountain-Time input rule, per-course conventions, assessment naming, "
+        "and known tool bugs. Load this prompt before doing calendar work."
+    ),
+)
+def calendar_workflow() -> str:
+    # Custom instructions for agents that manage the user's academic calendars.
+    return """# CalDAV Calendar Workflow — Fall 2026 Academic Calendars
+
+## 1. TIMEZONE RULE (CRITICAL)
+- Input every start/end/due time as **MOUNTAIN TIME WALL-CLOCK** (America/Denver).
+  NEVER pre-convert to UTC. The server converts to UTC for storage and the user's
+  client renders back in Mountain time.
+- Example: a 7:30 AM class is entered as `07:30` — NOT `13:30`. Entering `13:30`
+  makes the event display at 1:30 PM (this broke 58 events once).
+- Optionally pass `timezone: "America/Denver"` to make intent explicit; it is
+  harmless. Plain Mountain wall-clock times are the verified working convention.
+
+## 2. FORMATS
+- Timed events: `YYYY-MM-DD HH:MM` (24h). All-day todos: `YYYY-MM-DD`.
+- Todos default to all-day. Use all-day todos for readings/homework/labs.
+
+## 3. CALENDAR LAYOUT
+- `Academic Calendar`: master schedule (class sessions, M-day/T-day markers,
+  holidays) — READ-ONLY, never modify; use as the source of session dates.
+- Per-class calendars: `COMPSCI 210`, `ECE 245`, `PHYSICS 215`, `ECE 215S`,
+  `CHINESE 221`, `PHYED 484B`, `SOCSCI 311`.
+- `Tests and Quizzes`: ALL graded assessments for all courses as timed events.
+- `Personal`, `Squadron`, `Bookings`, `Birthdays`, `Financial`: leave alone.
+
+## 4. COURSE CONVENTIONS
+- COMPSCI 210: 41 lesson events `Lsn N: <topic>` at 07:30-09:23; 17 named
+  assignment todos; assessments `Quiz 1`-`Quiz 10`, `PA1`-`PA4`,
+  `PEX1/2 written defense`, `Team PEX due / presentations` (unprefixed, legacy).
+- ECE 245: NO lesson events; todos only — `Reading: <source> (<topic>)`,
+  `HW H1`-`H24`, `Lab N: <topic>` + `Multisim take-home`. Assessments are
+  course-prefixed: `ECE 245 Quiz 1`-`6`, `ECE 245 GR 1` (Sep 14), `GR 2` (Oct 30),
+  `GR 3` (Dec 4). GRs and quizzes are both timed tests at the class slot (07:30).
+- In the shared `Tests and Quizzes` calendar, always prefix assessments with the
+  course name (except existing COMPSCI 210 items).
+
+## 5. ADDING A NEW COURSE
+1. Extract the syllabus (PDFs via `pdftotext -layout`; HTML read directly).
+2. Pull that course's sessions from `Academic Calendar` -> assign lesson dates
+   (lesson N maps to the Nth session chronologically).
+3. Confirm/create the per-course calendar.
+4. GRs/quizzes/exams -> timed events in `Tests and Quizzes`, course-prefixed,
+   at the class slot time.
+5. Readings -> all-day todos in the course calendar, due on the lesson day.
+6. Homework/labs -> all-day todos with due dates; note assigned lesson/date in
+   the description.
+7. Re-fetch to verify counts and times.
+
+## 6. KNOWN TOOL BUGS
+- `create_calendar_events` (batch) is BROKEN ('str' object has no attribute
+  'tzinfo'). Create events ONE AT A TIME with `create_calendar_event`.
+- `create_todos` (batch) WORKS — batch in groups of ~10.
+- update/delete match by EXACT summary — copy it from the get output.
+- `get_calendar_events` shows a `+00:00` (UTC) suffix — ignore it; judge by
+  wall-clock digits only, the client renders Mountain time."""
+
 
 @mcp.tool(
     name="get_calendar_info",
@@ -76,35 +294,14 @@ def get_calendar_info(
         ..., description="Name of the calendar to get information about"
     )
 ):
-    """
-    Tool to get detailed information about a specific calendar.
-    """
+    """Tool to get detailed information about a specific calendar."""
     try:
-        principal = client.principal()
-        calendars = principal.calendars()
-        calendar = next((cal for cal in calendars if cal.name == calendar_name), None)
-
-        if not calendar:
-            return f"Calendar '{calendar_name}' not found."
-
-        # Get calendar properties
+        calendar = _find_calendar(calendar_name)
         events = calendar.events()
         event_count = len(events) if events else 0
-
-        info = {
-            "name": calendar.name,
-            "url": str(calendar.url),
-            "display_name": getattr(
-                calendar, "get_display_name", lambda: calendar.name
-            )(),
-            "event_count": event_count,
-            "supported_components": getattr(
-                calendar, "get_supported_components", lambda: ["VEVENT"]
-            )(),
-        }
-
         return (
-            f"Calendar '{calendar_name}' info: {event_count} events, URL: {info['url']}"
+            f"Calendar '{calendar_name}' info: {event_count} events, "
+            f"URL: {calendar.url}, Display name: {calendar.get_display_name()}"
         )
     except Exception as e:
         return f"Error getting calendar info: {str(e)}"
@@ -112,9 +309,7 @@ def get_calendar_info(
 
 @mcp.tool()
 def get_calendars():
-    """
-    Tool to get a list of calendars with their content types.
-    """
+    """Tool to get a list of calendars with their content types."""
     try:
         principal = client.principal()
         calendars = principal.calendars()
@@ -124,20 +319,15 @@ def get_calendars():
         calendar_list = []
         for calendar in calendars:
             try:
-                # Get counts
                 events = calendar.events()
                 todos = calendar.todos()
                 event_count = len(events) if events else 0
                 todo_count = len(todos) if todos else 0
-
-                # Get supported components
                 supported = calendar.get_supported_components()
-
-                calendar_info = (
+                calendar_list.append(
                     f"{calendar.name} - Events: {event_count}, Todos: {todo_count} "
                     f"(Supports: {', '.join(supported)})"
                 )
-                calendar_list.append(calendar_info)
             except Exception as e:
                 calendar_list.append(f"{calendar.name} - Error: {str(e)}")
 
@@ -148,38 +338,21 @@ def get_calendars():
 
 @mcp.tool(name="get_calendar_capabilities")
 def get_calendar_capabilities(calendar_name: str):
-    """
-    Get what types of components (events, todos) a calendar supports.
-    """
+    """Get what types of components (events, todos) a calendar supports."""
     try:
-        principal = client.principal()
-        calendars = principal.calendars()
-        calendar = next((cal for cal in calendars if cal.name == calendar_name), None)
-
-        if not calendar:
-            return f"Calendar '{calendar_name}' not found."
-
-        # Check supported components
+        calendar = _find_calendar(calendar_name)
         supported = calendar.get_supported_components()
-
-        capabilities = {
-            "supports_events": "VEVENT" in supported,
-            "supports_todos": "VTODO" in supported,
-            "all_components": supported,
-        }
-
         return f"Calendar '{calendar_name}' supports: {', '.join(supported)}"
     except Exception as e:
         return f"Error checking capabilities: {str(e)}"
 
 
-from typing import Optional
-from datetime import datetime
-
-
 @mcp.tool(
     name="get_calendar_events",
-    description="Get events from specific or all calendars, annotating calendar names",
+    description=(
+        "Get events from a specific or all calendars. Results are date-filtered, "
+        "sorted chronologically, and all times are shown in local time."
+    ),
 )
 def get_calendar_events(
     calendar_name: Optional[str] = Field(
@@ -193,87 +366,92 @@ def get_calendar_events(
         None, description="End date for events (YYYY-MM-DD format)"
     ),
     limit: Optional[int] = Field(10, description="Maximum number of events to return"),
+    timezone: Optional[str] = Field(
+        None,
+        description="IANA timezone name of the user (e.g. 'America/Denver') used for date filtering and formatting output times",
+    ),
 ):
-    """
-    Tool to get events from a specific calendar or all calendars, with optional date filtering.
-    Each event is annotated with its calendar name.
-    """
+    """Get events from a specific calendar or all calendars, with optional date filtering."""
     try:
         principal = client.principal()
         calendars = principal.calendars()
+        tz = resolve_tz(timezone)
 
-        # Set date range if provided
-        start_dt = None
-        end_dt = None
-        if start_date:
-            start_dt = datetime.strptime(start_date, "%Y-%m-%d")
-        if end_date:
-            end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+        start = parse_date(start_date) if start_date else None
+        end = parse_date(end_date) if end_date else None
 
-        event_list = []
-        total_events = 0
-
-        # If calendar_name is provided, filter for that calendar only
         if calendar_name:
-            calendar = next(
-                (cal for cal in calendars if cal.name == calendar_name), None
-            )
+            calendar = next((cal for cal in calendars if cal.name == calendar_name), None)
             if not calendar:
                 return f"Calendar '{calendar_name}' not found."
             calendars = [calendar]
 
+        results = []
+
         for calendar in calendars:
-            cal_name = calendar.name
-            # Get events with optional date filtering
-            if start_dt and end_dt:
-                events = calendar.date_search(start=start_dt, end=end_dt)
+            # Use a server-side time-range search when both bounds are given,
+            # otherwise fetch everything and filter client-side.
+            if start and end:
+                events = calendar.search(
+                    start=day_start(start, tz),
+                    end=day_after(end, tz),
+                    comp_class=caldav.Event,
+                )
             else:
                 events = calendar.events()
 
-            for i, event in enumerate(events):
-                if limit and total_events >= limit:
-                    break
-
+            for event in events:
                 try:
-                    vevent = event.vobject_instance.vevent  # type: ignore
-                    summary = getattr(vevent, "summary", None)
-                    dtstart = getattr(vevent, "dtstart", None)
-                    dtend = getattr(vevent, "dtend", None)
-                    description = getattr(vevent, "description", None)
-
-                    event_info = {
-                        "summary": summary.value if summary else "No title",
-                        "start": str(dtstart.value) if dtstart else "No start time",
-                        "end": str(dtend.value) if dtend else "No end time",
-                        "description": (
-                            description.value if description else "No description"
-                        ),
-                        "calendar": cal_name,
-                    }
-
-                    event_list.append(
-                        f"{event_info['summary']} (from: {event_info['calendar']}, {event_info['start']} - {event_info['end']})"
+                    comp = event.icalendar_component
+                    summary = str(comp.get("summary")) if "summary" in comp else "No title"
+                    description = (
+                        str(comp.get("description"))
+                        if "description" in comp
+                        else "No description"
                     )
-                    total_events += 1
+                    start_val = comp.get("dtstart").dt if "dtstart" in comp else None
+                    end_val = comp.get("dtend").dt if "dtend" in comp else None
+
+                    start_utc = to_utc(start_val, tz)
+                    if start_utc is None:
+                        continue
+
+                    if not (start and end):
+                        if start and start_utc < day_start(start, tz):
+                            continue
+                        if end and start_utc >= day_after(end, tz):
+                            continue
+
+                    results.append(
+                        (
+                            start_utc,
+                            f"{summary} (from: {calendar.name}, "
+                            f"{format_dt(start_val, tz)} - {format_dt(end_val, tz)})",
+                        )
+                    )
                 except Exception as e:
-                    event_list.append(f"Error parsing event from {cal_name}: {str(e)}")
-                    total_events += 1
+                    results.append(
+                        (
+                            datetime.max.replace(tzinfo=UTC),
+                            f"Error parsing event from {calendar.name}: {str(e)}",
+                        )
+                    )
+
+        results.sort(key=lambda r: r[0])
+        event_list = [text for _, text in results]
+        if limit is not None:
+            event_list = event_list[:limit]
 
         if not event_list:
-            if calendar_name:
-                return f"No events found in calendar '{calendar_name}'."
-            else:
-                return "No events found in any calendar."
+            source = f"calendar '{calendar_name}'" if calendar_name else "any calendar"
+            return f"No events found in {source}."
 
-        if calendar_name:
-            return (
-                f"Events in '{calendar_name}' ({len(event_list)} found): "
-                + "; ".join(event_list)
-            )
-        else:
-            return f"Events from all calendars ({total_events} found): " + "; ".join(
-                event_list
-            )
+        prefix = (
+            f"Events in '{calendar_name}' ({len(event_list)} found): "
+            if calendar_name
+            else f"Events from all calendars ({len(event_list)} found): "
+        )
+        return prefix + "; ".join(event_list)
     except Exception as e:
         return f"Error retrieving events: {str(e)}"
 
@@ -285,49 +463,49 @@ def create_calendar_event(
     ),
     summary: str = Field(..., description="Title/summary of the event"),
     start_datetime: str = Field(
-        ..., description="Start date and time (YYYY-MM-DD HH:MM format)"
+        ..., description="Start date and time (YYYY-MM-DD HH:MM in local time)"
     ),
     end_datetime: str = Field(
-        ..., description="End date and time (YYYY-MM-DD HH:MM format)"
+        ..., description="End date and time (YYYY-MM-DD HH:MM in local time)"
     ),
     description: Optional[str] = Field(None, description="Description of the event"),
     location: Optional[str] = Field(None, description="Location of the event"),
+    timezone: Optional[str] = Field(
+        None,
+        description="IANA timezone name of the user (e.g. 'America/Denver') that start_datetime/end_datetime are in",
+    ),
 ):
-    """
-    Tool to create a new event in a specific calendar.
-    """
+    """Create a new event in a specific calendar. Times are in the user's local timezone."""
     try:
-        principal = client.principal()
-        calendars = principal.calendars()
-        calendar = next((cal for cal in calendars if cal.name == calendar_name), None)
+        calendar = _find_calendar(calendar_name)
+        tz = resolve_tz(timezone)
 
-        if not calendar:
-            return f"Calendar '{calendar_name}' not found."
+        start_dt = parse_dt_local(start_datetime, tz)
+        end_dt = parse_dt_local(end_datetime, tz)
+        if end_dt <= start_dt:
+            return "Error creating event: end_datetime must be after start_datetime."
 
-        # Parse datetime strings
-        start_dt = datetime.strptime(start_datetime, "%Y-%m-%d %H:%M")
-        end_dt = datetime.strptime(end_datetime, "%Y-%m-%d %H:%M")
-
-        # Create the event
-        calendar.add_event(
+        ical = _build_event_ical(
             summary=summary,
-            dtstart=start_dt,
-            dtend=end_dt,
-            description=description if description else None,
-            location=location if location else None,
+            start_dt=start_dt,
+            end_dt=end_dt,
+            description=description,
+            location=location,
         )
-
-        return f"Event '{summary}' created successfully in calendar '{calendar_name}'"
+        calendar.save_event(ical)
+        return (
+            f"Event '{summary}' created successfully in calendar '{calendar_name}' "
+            f"({format_dt(start_dt, tz)} - {format_dt(end_dt, tz)})"
+        )
     except ValueError as e:
-        return f"Error parsing datetime format: {str(e)}. Please use YYYY-MM-DD HH:MM format."
+        return f"Error parsing datetime format: {str(e)}. Please use YYYY-MM-DD HH:MM format (local time)."
     except Exception as e:
         return f"Error creating event: {str(e)}"
 
 
-
 @mcp.tool(
     name="create_calendar_events",
-    description="Create multiple events in a specific calendar in batch."
+    description="Create multiple events in a specific calendar in batch. Times are interpreted as local time.",
 )
 def create_calendar_events(
     calendar_name: str = Field(..., description="Name of the target calendar"),
@@ -335,26 +513,22 @@ def create_calendar_events(
         ..., description=(
             "List of events. Each item must include: "
             "summary, start_datetime (YYYY-MM-DD HH:MM), end_datetime (YYYY-MM-DD HH:MM). "
+            "Times are in the user's local timezone (see timezone param). "
             "Optional: description, location."
         )
-    )
+    ),
+    timezone: Optional[str] = Field(
+        None,
+        description="IANA timezone name of the user (e.g. 'America/Denver') that the event times are in",
+    ),
 ) -> Dict[str, List[str]]:
-    """
-    Creates multiple events in a given calendar.
-    Returns a dict with 'success' and 'errors' lists.
-    """
+    """Create multiple events in a given calendar. Returns success/errors lists."""
     results = {"success": [], "errors": []}
 
     try:
-        # Locate target calendar once, not per event
-        principal = client.principal()
-        calendars = principal.calendars()
-        calendar = next((cal for cal in calendars if cal.name == calendar_name), None)
+        calendar = _find_calendar(calendar_name)
+        tz = resolve_tz(timezone)
 
-        if not calendar:
-            return {"success": [], "errors": [f"Calendar '{calendar_name}' not found."]}
-
-        # Process each event in the batch
         for idx, evt in enumerate(events, start=1):
             try:
                 summary = evt.get("summary")
@@ -363,51 +537,40 @@ def create_calendar_events(
                 description = evt.get("description")
                 location = evt.get("location")
 
-                # Required field checks
                 if not summary or not start_str or not end_str:
-                    raise ValueError("Missing one of: summary, start_datetime, end_datetime")
+                    raise ValueError(
+                        "Missing one of: summary, start_datetime, end_datetime"
+                    )
 
-                # Parse and validate datetimes
                 try:
-                    start_dt = datetime.strptime(start_str, "%Y-%m-%d %H:%M")
-                    end_dt = datetime.strptime(end_str, "%Y-%m-%d %H:%M")
+                    start_dt = parse_dt_local(start_str, tz)
+                    end_dt = parse_dt_local(end_str, tz)
                 except ValueError:
-                    raise ValueError("Invalid datetime format. Use 'YYYY-MM-DD HH:MM'.")
+                    raise ValueError("Invalid datetime format. Use 'YYYY-MM-DD HH:MM' (local time).")
 
                 if end_dt <= start_dt:
                     raise ValueError("end_datetime must be after start_datetime")
 
-                # Build vEvent
-                event_obj = vobject.iCalendar()
-                vevent = event_obj.add("vevent")
-                vevent.add("uid").value = f"{datetime.now().timestamp()}-{summary}"
-                vevent.add("summary").value = summary
-                vevent.add("dtstart").value = start_dt.strftime("%Y%m%dT%H%M%S")
-                vevent.add("dtend").value = end_dt.strftime("%Y%m%dT%H%M%S")
-                vevent.add("dtstamp").value = datetime.now()
-
-                if description:
-                    vevent.add("description").value = description
-                if location:
-                    vevent.add("location").value = location
-
-                # Save to the calendar
-                calendar.save_event(event_obj.serialize())
+                ical = _build_event_ical(
+                    summary=summary,
+                    start_dt=start_dt,
+                    end_dt=end_dt,
+                    description=description,
+                    location=location,
+                )
+                calendar.save_event(ical)
                 results["success"].append(
                     f"[Event #{idx}] '{summary}' created successfully."
                 )
-
             except Exception as e:
-                # Don't stop entire batch — log per event failure
                 results["errors"].append(
                     f"[Event #{idx}] {evt.get('summary', '<no summary>')}: {str(e)}"
                 )
 
         return results
-
     except Exception as e:
-        # Calendar lookup or catastrophic failure
         return {"success": [], "errors": [f"Batch creation failed: {str(e)}"]}
+
 
 @mcp.tool(name="delete_calendar_event", description="Delete an event from a calendar")
 def delete_calendar_event(
@@ -416,25 +579,16 @@ def delete_calendar_event(
     ),
     event_summary: str = Field(..., description="Summary/title of the event to delete"),
 ):
-    """
-    Tool to delete an event from a specific calendar by its summary.
-    """
+    """Delete an event from a specific calendar by its summary."""
     try:
-        principal = client.principal()
-        calendars = principal.calendars()
-        calendar = next((cal for cal in calendars if cal.name == calendar_name), None)
-
-        if not calendar:
-            return f"Calendar '{calendar_name}' not found."
+        calendar = _find_calendar(calendar_name)
 
         events = calendar.events()
         matching_events = []
-
         for event in events:
             try:
-                vevent = event.vobject_instance.vevent  # type: ignore
-                summary = getattr(vevent, "summary", None)
-                if summary and summary.value == event_summary:
+                comp = event.icalendar_component
+                if "summary" in comp and str(comp.get("summary")) == event_summary:
                     matching_events.append(event)
             except Exception:
                 continue
@@ -445,7 +599,6 @@ def delete_calendar_event(
         if len(matching_events) > 1:
             return f"Multiple events found with summary '{event_summary}'. Please be more specific."
 
-        # Delete the event
         matching_events[0].delete()
         return f"Event '{event_summary}' deleted successfully from calendar '{calendar_name}'"
     except Exception as e:
@@ -466,35 +619,31 @@ def update_calendar_event(
         None, description="New title/summary for the event"
     ),
     new_start_datetime: Optional[str] = Field(
-        None, description="New start date and time (YYYY-MM-DD HH:MM format)"
+        None, description="New start date and time (YYYY-MM-DD HH:MM in local time)"
     ),
     new_end_datetime: Optional[str] = Field(
-        None, description="New end date and time (YYYY-MM-DD HH:MM format)"
+        None, description="New end date and time (YYYY-MM-DD HH:MM in local time)"
     ),
     new_description: Optional[str] = Field(
         None, description="New description for the event"
     ),
     new_location: Optional[str] = Field(None, description="New location for the event"),
+    timezone: Optional[str] = Field(
+        None,
+        description="IANA timezone name of the user (e.g. 'America/Denver') that the new datetimes are in",
+    ),
 ):
-    """
-    Tool to update an existing event in a specific calendar.
-    """
+    """Update an existing event in a specific calendar. Times are in the user's local timezone."""
     try:
-        principal = client.principal()
-        calendars = principal.calendars()
-        calendar = next((cal for cal in calendars if cal.name == calendar_name), None)
-
-        if not calendar:
-            return f"Calendar '{calendar_name}' not found."
+        calendar = _find_calendar(calendar_name)
+        tz = resolve_tz(timezone)
 
         events = calendar.events()
         matching_events = []
-
         for event in events:
             try:
-                vevent = event.vobject_instance.vevent  # type: ignore
-                summary = getattr(vevent, "summary", None)
-                if summary and summary.value == event_summary:
+                comp = event.icalendar_component
+                if "summary" in comp and str(comp.get("summary")) == event_summary:
                     matching_events.append(event)
             except Exception:
                 continue
@@ -505,35 +654,30 @@ def update_calendar_event(
         if len(matching_events) > 1:
             return f"Multiple events found with summary '{event_summary}'. Please be more specific."
 
-        # Update the event
         event = matching_events[0]
-        vevent = event.vobject_instance.vevent
+        comp = event.icalendar_component
 
         if new_summary:
-            vevent.summary.value = new_summary
+            comp["summary"] = new_summary
         if new_start_datetime:
-            vevent.dtstart.value = datetime.strptime(
-                new_start_datetime, "%Y-%m-%d %H:%M"
-            )
+            comp.pop("dtstart")
+            comp.add("dtstart", parse_dt_local(new_start_datetime, tz))
         if new_end_datetime:
-            vevent.dtend.value = datetime.strptime(new_end_datetime, "%Y-%m-%d %H:%M")
-        if new_description:
-            if hasattr(vevent, "description"):
-                vevent.description.value = new_description
-            else:
-                vevent.add("description").value = new_description
-        if new_location:
-            if hasattr(vevent, "location"):
-                vevent.location.value = new_location
-            else:
-                vevent.add("location").value = new_location
+            comp.pop("dtend")
+            comp.add("dtend", parse_dt_local(new_end_datetime, tz))
+        if new_description is not None:
+            comp.pop("description", None)
+            comp.add("description", new_description)
+        if new_location is not None:
+            comp.pop("location", None)
+            comp.add("location", new_location)
 
-        # Save the updated event
+        event.icalendar_component = comp
         event.save()
 
         return f"Event '{event_summary}' updated successfully in calendar '{calendar_name}'"
     except ValueError as e:
-        return f"Error parsing datetime format: {str(e)}. Please use YYYY-MM-DD HH:MM format."
+        return f"Error parsing datetime format: {str(e)}. Please use YYYY-MM-DD HH:MM format (local time)."
     except Exception as e:
         return f"Error updating event: {str(e)}"
 
@@ -552,57 +696,60 @@ def search_calendar_events(
         None, description="End date for search (YYYY-MM-DD format)"
     ),
     limit: Optional[int] = Field(10, description="Maximum number of events to return"),
+    timezone: Optional[str] = Field(
+        None,
+        description="IANA timezone name of the user (e.g. 'America/Denver') used for date filtering and formatting output times",
+    ),
 ):
-    """
-    Tool to search for events across all calendars.
-    """
+    """Search for events across all calendars, with optional date filtering."""
     try:
         principal = client.principal()
         calendars = principal.calendars()
-
         if not calendars:
             return "No calendars found."
+        tz = resolve_tz(timezone)
+
+        start = parse_date(start_date) if start_date else None
+        end = parse_date(end_date) if end_date else None
 
         matching_events = []
 
         for calendar in calendars:
             try:
-                # Set date range if provided
-                if start_date and end_date:
-                    start_dt = datetime.strptime(start_date, "%Y-%m-%d")
-                    end_dt = datetime.strptime(end_date, "%Y-%m-%d")
-                    events = calendar.date_search(start=start_dt, end=end_dt)
-                else:
-                    events = calendar.events()
-
+                events = calendar.events()
                 for event in events:
                     try:
-                        vevent = event.vobject_instance.vevent  # type: ignore
-                        summary = getattr(vevent, "summary", None)
-                        description = getattr(vevent, "description", None)
-                        dtstart = getattr(vevent, "dtstart", None)
+                        comp = event.icalendar_component
+                        summary = str(comp.get("summary")) if "summary" in comp else ""
+                        description = (
+                            str(comp.get("description"))
+                            if "description" in comp
+                            else ""
+                        )
+                        start_val = (
+                            comp.get("dtstart").dt if "dtstart" in comp else None
+                        )
+                        start_utc = to_utc(start_val, tz)
 
-                        summary_text = summary.value if summary else ""
-                        description_text = description.value if description else ""
+                        if start_utc is not None:
+                            if start and start_utc < day_start(start, tz):
+                                continue
+                            if end and start_utc >= day_after(end, tz):
+                                continue
 
                         if (
-                            query.lower() in summary_text.lower()
-                            or query.lower() in description_text.lower()
+                            query.lower() in summary.lower()
+                            or query.lower() in description.lower()
                         ):
-
                             matching_events.append(
                                 {
                                     "calendar": calendar.name,
-                                    "summary": summary_text,
-                                    "start": (
-                                        str(dtstart.value)
-                                        if dtstart
-                                        else "No start time"
-                                    ),
+                                    "summary": summary,
+                                    "start": format_dt(start_val, tz),
                                     "description": (
-                                        description_text[:100] + "..."
-                                        if len(description_text) > 100
-                                        else description_text
+                                        description[:100] + "..."
+                                        if len(description) > 100
+                                        else description
                                     ),
                                 }
                             )
@@ -622,10 +769,7 @@ def search_calendar_events(
 
         result = f"Found {len(matching_events)} events matching '{query}':\n"
         for event in matching_events:
-            result += (
-                f"- {event['summary']} in {event['calendar']} ({event['start']})\n"
-            )
-
+            result += f"- {event['summary']} in {event['calendar']} ({event['start']})\n"
         return result
     except Exception as e:
         return f"Error searching events: {str(e)}"
@@ -638,29 +782,17 @@ def create_calendar(
         None, description="Display name for the calendar"
     ),
 ):
-    """
-    Tool to create a new calendar.
-    """
+    """Create a new calendar."""
     try:
         principal = client.principal()
-
-        # Check if calendar already exists
-        existing_calendars = principal.calendars()
-        if any(cal.name == calendar_name for cal in existing_calendars):
+        existing = principal.calendars()
+        if any(cal.name == calendar_name for cal in existing):
             return f"Calendar '{calendar_name}' already exists."
 
-        # Create new calendar
-        new_calendar = principal.make_calendar(
-            name=calendar_name, cal_id=display_name or calendar_name
-        )
-
+        principal.make_calendar(name=calendar_name, cal_id=display_name or calendar_name)
         return f"Calendar '{calendar_name}' created successfully."
     except Exception as e:
         return f"Error creating calendar: {str(e)}"
-
-
-from typing import Optional
-from datetime import datetime
 
 
 @mcp.tool(
@@ -677,16 +809,17 @@ def get_todos(
         description="Filter by status: NEEDS-ACTION, COMPLETED, IN-PROCESS, CANCELLED",
     ),
     limit: Optional[int] = Field(10, description="Maximum number of todos to return"),
+    timezone: Optional[str] = Field(
+        None,
+        description="IANA timezone name of the user (e.g. 'America/Denver') used to format due dates in output",
+    ),
 ):
-    """
-    Tool to get todos from a specific or all calendars, with optional status filtering.
-    Each todo is annotated with its calendar name.
-    """
+    """Get todos from a specific or all calendars, with optional status filtering."""
     try:
         principal = client.principal()
         calendars = principal.calendars()
+        tz = resolve_tz(timezone)
 
-        # If calendar_name is provided, filter for that calendar only
         if calendar_name:
             calendar = next(
                 (cal for cal in calendars if cal.name == calendar_name), None
@@ -699,67 +832,52 @@ def get_todos(
         total_todos = 0
 
         for calendar in calendars:
-            cal_name = calendar.name
             todos = calendar.todos()
-
-            for i, todo in enumerate(todos):
+            for todo in todos:
                 if limit and total_todos >= limit:
                     break
 
                 try:
-                    vtodo = todo.vobject_instance.vtodo  # type: ignore
-                    summary = getattr(vtodo, "summary", None)
-                    todo_status = getattr(vtodo, "status", None)
-                    due = getattr(vtodo, "due", None)
-                    description = getattr(vtodo, "description", None)
-                    completed = getattr(vtodo, "completed", None)
+                    comp = todo.icalendar_component
+                    summary = str(comp.get("summary")) if "summary" in comp else "No title"
+                    todo_status = (
+                        str(comp.get("status")) if "status" in comp else "NEEDS-ACTION"
+                    )
+                    due_val = comp.get("due").dt if "due" in comp else None
+                    description = (
+                        str(comp.get("description"))
+                        if "description" in comp
+                        else "No description"
+                    )
+                    completed = (
+                        str(comp.get("completed"))
+                        if "completed" in comp
+                        else "Not completed"
+                    )
 
-                    # Filter by status if specified
-                    if (
-                        status
-                        and todo_status
-                        and todo_status.value.upper() != status.upper()
-                    ):
+                    if status and todo_status.upper() != status.upper():
                         continue
 
-                    todo_info = {
-                        "summary": summary.value if summary else "No title",
-                        "status": todo_status.value if todo_status else "NEEDS-ACTION",
-                        "due": str(due.value) if due else "No due date",
-                        "description": (
-                            description.value if description else "No description"
-                        ),
-                        "completed": (
-                            str(completed.value) if completed else "Not completed"
-                        ),
-                        "calendar": cal_name,
-                    }
-
-                    status_indicator = (
-                        "✓" if todo_info["status"] == "COMPLETED" else "○"
-                    )
+                    indicator = "✓" if todo_status == "COMPLETED" else "○"
                     todo_list.append(
-                        f"{status_indicator} {todo_info['summary']} (from: {todo_info['calendar']}, Due: {todo_info['due']}, Status: {todo_info['status']})"
+                        f"{indicator} {summary} (from: {calendar.name}, "
+                        f"Due: {format_dt(due_val, tz)}, Status: {todo_status})"
                     )
                     total_todos += 1
                 except Exception as e:
-                    todo_list.append(f"Error parsing todo from {cal_name}: {str(e)}")
+                    todo_list.append(f"Error parsing todo from {calendar.name}: {str(e)}")
                     total_todos += 1
 
         if not todo_list:
-            if calendar_name:
-                return f"No todos found in calendar '{calendar_name}'."
-            else:
-                return "No todos found in any calendar."
+            source = f"calendar '{calendar_name}'" if calendar_name else "any calendar"
+            return f"No todos found in {source}."
 
-        if calendar_name:
-            return f"Todos in '{calendar_name}' ({len(todo_list)} found): " + "; ".join(
-                todo_list
-            )
-        else:
-            return f"Todos from all calendars ({total_todos} found): " + "; ".join(
-                todo_list
-            )
+        prefix = (
+            f"Todos in '{calendar_name}' ({len(todo_list)} found): "
+            if calendar_name
+            else f"Todos from all calendars ({total_todos} found): "
+        )
+        return prefix + "; ".join(todo_list)
     except Exception as e:
         return f"Error retrieving todos: {str(e)}"
 
@@ -771,100 +889,78 @@ def create_todo(
     ),
     summary: str = Field(..., description="Title/summary of the todo"),
     description: Optional[str] = Field(None, description="Description of the todo"),
-    due_date: Optional[str] = Field(None, description="Due date (YYYY-MM-DD format for all-day, YYYY-MM-DD HH:MM for specific time)"),
-    all_day: Optional[bool] = Field(True, description="Whether the todo is all-day (default: True)"),
+    due_date: Optional[str] = Field(
+        None,
+        description="Due date: YYYY-MM-DD for all-day, YYYY-MM-DD HH:MM (local time) for timed",
+    ),
+    all_day: Optional[bool] = Field(
+        True, description="Whether the todo is all-day (default: True)"
+    ),
     status: Optional[str] = Field(
         "NEEDS-ACTION",
         description="Status: NEEDS-ACTION, IN-PROCESS, COMPLETED, CANCELLED",
     ),
+    timezone: Optional[str] = Field(
+        None,
+        description="IANA timezone name of the user (e.g. 'America/Denver') that due_date is in",
+    ),
 ):
-    """
-    Tool to create a new todo in a specific calendar.
-    Supports both all-day todos (default) and timed todos.
-    """
+    """Create a new todo in a specific calendar. Supports all-day and timed todos."""
     try:
-        principal = client.principal()
-        calendars = principal.calendars()
-        calendar = next((cal for cal in calendars if cal.name == calendar_name), None)
+        calendar = _find_calendar(calendar_name)
+        tz = resolve_tz(timezone)
 
-        if not calendar:
-            return f"Calendar '{calendar_name}' not found."
-
-        # Create the todo
-        todo = vobject.iCalendar()
-        todo.add("vtodo")
-
-        vtodo = todo.vtodo
-        vtodo.add("uid").value = str(uuid.uuid4())
-        vtodo.add("summary").value = summary
-        vtodo.add("status").value = status.upper() if status else "NEEDS-ACTION"
-        vtodo.add("dtstamp").value = datetime.now()
-        vtodo.add("created").value = datetime.now()
-
-        if description:
-            vtodo.add("description").value = description
-            
+        due = None
         if due_date:
             try:
-                # Check if time is included in the date string
-                has_time = len(due_date.split()) > 1 or ":" in due_date
-                
-                if has_time and not all_day:
-                    # Parse as datetime (YYYY-MM-DD HH:MM)
-                    due_dt = datetime.strptime(due_date, "%Y-%m-%d %H:%M")
-                    vtodo.add("due").value = due_dt
+                if all_day:
+                    due = parse_date(due_date.split()[0])
                 else:
-                    # Parse as date only (YYYY-MM-DD) - creates all-day todo
-                    # Extract just the date part if time was provided but all_day=True
-                    date_part = due_date.split()[0] if " " in due_date else due_date
-                    due_dt = datetime.strptime(date_part, "%Y-%m-%d").date()
-                    vtodo.add("due").value = due_dt
-                    
+                    due = parse_dt_local(due_date, tz)
             except ValueError as e:
-                return f"Error parsing date format: {due_date}. Please use YYYY-MM-DD for all-day or YYYY-MM-DD HH:MM for timed todos. Error: {str(e)}"
-                    
-      
-        # Save the todo
-        calendar.save_event(todo.serialize())
+                return (
+                    f"Error parsing date format: {due_date}. "
+                    f"Use YYYY-MM-DD for all-day or YYYY-MM-DD HH:MM (local time) for timed. "
+                    f"Error: {str(e)}"
+                )
+
+        ical = _build_todo_ical(
+            summary=summary,
+            description=description,
+            due=due,
+            status=status or "NEEDS-ACTION",
+        )
+        calendar.save_event(ical)
 
         todo_type = "all-day" if all_day else "timed"
         return f"Todo '{summary}' created successfully as {todo_type} in calendar '{calendar_name}'"
-        
     except Exception as e:
         return f"Error creating todo: {str(e)}"
 
+
 @mcp.tool(
     name="create_todos",
-    description="Create multiple todos in a specific calendar in batch."
+    description="Create multiple todos in a specific calendar in batch.",
 )
 def create_todos(
     calendar_name: str = Field(..., description="The name of the target calendar"),
     todos: List[Dict[str, Any]] = Field(
         ..., description="A list of todos, each with summary, optional description, due_date, etc."
-    )
+    ),
+    timezone: Optional[str] = Field(
+        None,
+        description="IANA timezone name of the user (e.g. 'America/Denver') that the due dates are in",
+    ),
 ) -> Dict[str, Any]:
-    """
-    Creates multiple todos in a given calendar.
-
-    Returns:
-        dict with 'success' list and 'errors' list for transparency.
-    """
-    results = {
-        "success": [],
-        "errors": []
-    }
+    """Create multiple todos in a given calendar. Returns success/errors lists."""
+    results = {"success": [], "errors": []}
 
     try:
-        principal = client.principal()
-        calendars = principal.calendars()
-        calendar = next((cal for cal in calendars if cal.name == calendar_name), None)
-
-        if not calendar:
-            return {"success": [], "errors": [f"Calendar '{calendar_name}' not found."]}
+        calendar = _find_calendar(calendar_name)
+        tz = resolve_tz(timezone)
 
         for idx, todo_data in enumerate(todos, start=1):
             try:
-                # Validate required fields
                 summary = todo_data.get("summary")
                 if not summary:
                     raise ValueError("Missing required field: summary")
@@ -874,54 +970,38 @@ def create_todos(
                 all_day: bool = todo_data.get("all_day", True)
                 status = todo_data.get("status", "NEEDS-ACTION")
 
-                # Build vTODO object
-                todo = vobject.iCalendar()
-                todo.add("vtodo")
-
-                vtodo = todo.vtodo
-                vtodo.add("uid").value = str(uuid.uuid4())
-                vtodo.add("summary").value = summary
-                vtodo.add("status").value = status.upper()
-                now = datetime.now()
-                vtodo.add("dtstamp").value = now
-                vtodo.add("created").value = now
-
-                if description:
-                    vtodo.add("description").value = description
-
+                due = None
                 if due_date:
                     try:
-                        has_time = len(due_date.split()) > 1 or ":" in due_date
-                        if has_time and not all_day:
-                            due_dt = datetime.strptime(due_date, "%Y-%m-%d %H:%M")
-                            vtodo.add("due").value = due_dt
+                        if all_day:
+                            due = parse_date(due_date.split()[0])
                         else:
-                            date_part = due_date.split()[0]
-                            due_dt = datetime.strptime(date_part, "%Y-%m-%d").date()
-                            vtodo.add("due").value = due_dt
+                            due = parse_dt_local(due_date, tz)
                     except ValueError as e:
                         raise ValueError(
                             f"Invalid date format for due_date '{due_date}': {str(e)}"
                         )
 
-                # Save event
-                calendar.save_event(todo.serialize())
+                ical = _build_todo_ical(
+                    summary=summary,
+                    description=description,
+                    due=due,
+                    status=status,
+                )
+                calendar.save_event(ical)
                 todo_type = "all-day" if all_day else "timed"
                 results["success"].append(
                     f"Todo '{summary}' created successfully as {todo_type}."
                 )
-
             except Exception as e:
-                # Capture any error for this item without stopping the batch
                 results["errors"].append(
                     f"[Todo #{idx}] {todo_data.get('summary', '<no summary>')}: {str(e)}"
                 )
 
         return results
-
     except Exception as e:
-        # Catastrophic failure (e.g., principal retrieval, calendar access)
         return {"success": [], "errors": [f"Batch creation failed: {str(e)}"]}
+
 
 @mcp.tool(name="update_todo", description="Update an existing todo in a calendar")
 def update_todo(
@@ -938,31 +1018,27 @@ def update_todo(
         None, description="New description for the todo"
     ),
     new_due_date: Optional[str] = Field(
-        None, description="New due date (YYYY-MM-DD format)"
+        None, description="New due date: YYYY-MM-DD or YYYY-MM-DD HH:MM (local time)"
     ),
     new_status: Optional[str] = Field(
         None, description="New status: NEEDS-ACTION, IN-PROCESS, COMPLETED, CANCELLED"
     ),
+    timezone: Optional[str] = Field(
+        None,
+        description="IANA timezone name of the user (e.g. 'America/Denver') that new_due_date is in",
+    ),
 ):
-    """
-    Tool to update an existing todo in a specific calendar.
-    """
+    """Update an existing todo in a specific calendar."""
     try:
-        principal = client.principal()
-        calendars = principal.calendars()
-        calendar = next((cal for cal in calendars if cal.name == calendar_name), None)
-
-        if not calendar:
-            return f"Calendar '{calendar_name}' not found."
+        calendar = _find_calendar(calendar_name)
+        tz = resolve_tz(timezone)
 
         todos = calendar.todos()
         matching_todos = []
-
         for todo in todos:
             try:
-                vtodo = todo.vobject_instance.vtodo  # type: ignore
-                summary = getattr(vtodo, "summary", None)
-                if summary and summary.value == todo_summary:
+                comp = todo.icalendar_component
+                if "summary" in comp and str(comp.get("summary")) == todo_summary:
                     matching_todos.append(todo)
             except Exception:
                 continue
@@ -973,37 +1049,28 @@ def update_todo(
         if len(matching_todos) > 1:
             return f"Multiple todos found with summary '{todo_summary}'. Please be more specific."
 
-        # Update the todo
         todo = matching_todos[0]
-        vtodo = todo.vobject_instance.vtodo
+        comp = todo.icalendar_component
 
         if new_summary:
-            vtodo.summary.value = new_summary
-        if new_description:
-            if hasattr(vtodo, "description"):
-                vtodo.description.value = new_description
-            else:
-                vtodo.add("description").value = new_description
+            comp["summary"] = new_summary
+        if new_description is not None:
+            comp.pop("description", None)
+            comp.add("description", new_description)
         if new_due_date:
-            due_dt = datetime.strptime(new_due_date, "%Y-%m-%d")
-            if hasattr(vtodo, "due"):
-                vtodo.due.value = due_dt
-            else:
-                vtodo.add("due").value = due_dt
-    
+            comp.pop("due")
+            comp.add("due", parse_due(new_due_date, tz))
         if new_status:
-            vtodo.status.value = new_status.upper()
+            comp["status"] = new_status.upper()
             if new_status.upper() == "COMPLETED":
-                vtodo.add("completed").value = datetime.now()
+                comp["completed"] = datetime.now(UTC)
 
-        # Save the updated todo
+        todo.icalendar_component = comp
         todo.save()
 
-        return (
-            f"Todo '{todo_summary}' updated successfully in calendar '{calendar_name}'"
-        )
+        return f"Todo '{todo_summary}' updated successfully in calendar '{calendar_name}'"
     except ValueError as e:
-        return f"Error parsing date format: {str(e)}. Please use YYYY-MM-DD format."
+        return f"Error parsing date format: {str(e)}. Use YYYY-MM-DD or YYYY-MM-DD HH:MM (local time)."
     except Exception as e:
         return f"Error updating todo: {str(e)}"
 
@@ -1015,25 +1082,16 @@ def delete_todo(
     ),
     todo_summary: str = Field(..., description="Summary/title of the todo to delete"),
 ):
-    """
-    Tool to delete a todo from a specific calendar by its summary.
-    """
+    """Delete a todo from a specific calendar by its summary."""
     try:
-        principal = client.principal()
-        calendars = principal.calendars()
-        calendar = next((cal for cal in calendars if cal.name == calendar_name), None)
-
-        if not calendar:
-            return f"Calendar '{calendar_name}' not found."
+        calendar = _find_calendar(calendar_name)
 
         todos = calendar.todos()
         matching_todos = []
-
         for todo in todos:
             try:
-                vtodo = todo.vobject_instance.vtodo  # type: ignore
-                summary = getattr(vtodo, "summary", None)
-                if summary and summary.value == todo_summary:
+                comp = todo.icalendar_component
+                if "summary" in comp and str(comp.get("summary")) == todo_summary:
                     matching_todos.append(todo)
             except Exception:
                 continue
@@ -1044,7 +1102,6 @@ def delete_todo(
         if len(matching_todos) > 1:
             return f"Multiple todos found with summary '{todo_summary}'. Please be more specific."
 
-        # Delete the todo
         matching_todos[0].delete()
         return f"Todo '{todo_summary}' deleted successfully from calendar '{calendar_name}'"
     except Exception as e:
@@ -1058,25 +1115,16 @@ def complete_todo(
     ),
     todo_summary: str = Field(..., description="Summary/title of the todo to complete"),
 ):
-    """
-    Tool to mark a todo as completed.
-    """
+    """Mark a todo as completed."""
     try:
-        principal = client.principal()
-        calendars = principal.calendars()
-        calendar = next((cal for cal in calendars if cal.name == calendar_name), None)
-
-        if not calendar:
-            return f"Calendar '{calendar_name}' not found."
+        calendar = _find_calendar(calendar_name)
 
         todos = calendar.todos()
         matching_todos = []
-
         for todo in todos:
             try:
-                vtodo = todo.vobject_instance.vtodo  # type: ignore
-                summary = getattr(vtodo, "summary", None)
-                if summary and summary.value == todo_summary:
+                comp = todo.icalendar_component
+                if "summary" in comp and str(comp.get("summary")) == todo_summary:
                     matching_todos.append(todo)
             except Exception:
                 continue
@@ -1087,19 +1135,15 @@ def complete_todo(
         if len(matching_todos) > 1:
             return f"Multiple todos found with summary '{todo_summary}'. Please be more specific."
 
-        # Mark as completed
         todo = matching_todos[0]
-        vtodo = todo.vobject_instance.vtodo
+        comp = todo.icalendar_component
+        comp["status"] = "COMPLETED"
+        comp["completed"] = datetime.now(UTC)
 
-        vtodo.status.value = "COMPLETED"
-        vtodo.add("completed").value = datetime.now()
-
-        # Save the updated todo
+        todo.icalendar_component = comp
         todo.save()
 
-        return (
-            f"Todo '{todo_summary}' marked as completed in calendar '{calendar_name}'"
-        )
+        return f"Todo '{todo_summary}' marked as completed in calendar '{calendar_name}'"
     except Exception as e:
         return f"Error completing todo: {str(e)}"
 
@@ -1114,59 +1158,57 @@ def search_todos(
         description="Filter by status: NEEDS-ACTION, COMPLETED, IN-PROCESS, CANCELLED",
     ),
     limit: Optional[int] = Field(10, description="Maximum number of todos to return"),
+    timezone: Optional[str] = Field(
+        None,
+        description="IANA timezone name of the user (e.g. 'America/Denver') used to format due dates in output",
+    ),
 ):
-    """
-    Tool to search for todos across all calendars.
-    """
+    """Search for todos across all calendars, with optional status filtering."""
     try:
         principal = client.principal()
         calendars = principal.calendars()
-
         if not calendars:
             return "No calendars found."
+        tz = resolve_tz(timezone)
 
         matching_todos = []
 
         for calendar in calendars:
             try:
                 todos = calendar.todos()
-
                 for todo in todos:
                     try:
-                        vtodo = todo.vobject_instance.vtodo  # type: ignore
-                        summary = getattr(vtodo, "summary", None)
-                        description = getattr(vtodo, "description", None)
-                        todo_status = getattr(vtodo, "status", None)
-                        due = getattr(vtodo, "due", None)
-
-                        summary_text = summary.value if summary else ""
-                        description_text = description.value if description else ""
-                        status_text = (
-                            todo_status.value if todo_status else "NEEDS-ACTION"
+                        comp = todo.icalendar_component
+                        summary = str(comp.get("summary")) if "summary" in comp else ""
+                        description = (
+                            str(comp.get("description"))
+                            if "description" in comp
+                            else ""
                         )
+                        todo_status = (
+                            str(comp.get("status")) if "status" in comp else "NEEDS-ACTION"
+                        )
+                        due_val = comp.get("due").dt if "due" in comp else None
 
-                        # Filter by status if specified
-                        if status and status_text.upper() != status.upper():
+                        if status and todo_status.upper() != status.upper():
                             continue
 
                         if (
-                            query.lower() in summary_text.lower()
-                            or query.lower() in description_text.lower()
+                            query.lower() in summary.lower()
+                            or query.lower() in description.lower()
                         ):
-                            status_indicator = (
-                                "✓" if status_text == "COMPLETED" else "○"
-                            )
+                            indicator = "✓" if todo_status == "COMPLETED" else "○"
                             matching_todos.append(
                                 {
                                     "calendar": calendar.name,
-                                    "summary": summary_text,
-                                    "status": status_text,
-                                    "due": (str(due.value) if due else "No due date"),
-                                    "indicator": status_indicator,
+                                    "summary": summary,
+                                    "status": todo_status,
+                                    "due": format_dt(due_val, tz),
+                                    "indicator": indicator,
                                     "description": (
-                                        description_text[:100] + "..."
-                                        if len(description_text) > 100
-                                        else description_text
+                                        description[:100] + "..."
+                                        if len(description) > 100
+                                        else description
                                     ),
                                 }
                             )
@@ -1190,7 +1232,6 @@ def search_todos(
                 f"- {todo['indicator']} {todo['summary']} in {todo['calendar']} "
                 f"(Due: {todo['due']}, Status: {todo['status']})\n"
             )
-
         return result
     except Exception as e:
         return f"Error searching todos: {str(e)}"

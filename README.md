@@ -224,11 +224,15 @@ Once connected, you can interact with your calendars using natural language:
 
 ## Time Zone Handling
 
-The server includes built-in timezone conversion for Mountain Time:
-- **Mountain Daylight Time (March-November)**: Adds 6 hours to convert to UTC
-- **Mountain Standard Time (November-March)**: Adds 7 hours to convert to UTC
+The MCP server runs **remotely**, so it cannot auto-detect the user's timezone. Instead, **every datetime tool accepts a `timezone` parameter** (IANA name like `America/Denver` or `UTC`) that the client passes in on each call. If omitted, the server falls back to the `CALDAV_TIMEZONE` env var, then to UTC.
 
-Military time is automatically converted to 24-hour format (e.g., `0645` becomes `06:45`).
+- Always pass the user's IANA timezone (e.g. `"America/Denver"`) to each calendar/todo tool call.
+- Datetime inputs are interpreted as the user's **local wall-clock time**: `YYYY-MM-DD HH:MM` for timed items, `YYYY-MM-DD` for all-day items.
+- Times are stored in UTC internally (with a `Z` suffix) so they are unambiguous on any provider.
+- All times returned by the server are converted to the timezone you supplied and labelled with the zone (e.g. `2026-08-11 06:45 MDT`), so results are consistent and match your source documents regardless of how the provider stored them.
+- Events are returned date-filtered (when `start_date`/`end_date` are provided) and sorted chronologically.
+
+No manual timezone conversion is required — just pass times as they appear in source documents (e.g. `06:45` Mountain Time on Aug 11 → `2026-08-11 06:45` with `timezone: "America/Denver"`). Military time is converted to 24-hour format first (e.g., `0645` becomes `06:45`).
 
 ## Troubleshooting
 
